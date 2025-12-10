@@ -1,61 +1,42 @@
 import http from 'http';
-import https from 'https';
+import { WebSocketServer } from 'ws';
 
 /**
  * MT5 Receiver Service
  * Deploy on Render.com
- * Receives data from MT5 EA and forwards to Backend Server
+ * Receives data from MT5 EA and stores it
+ * Backend Server connects via WebSocket to receive data
  */
 
-const BACKEND_SERVER_URL = process.env.BACKEND_SERVER_URL || 'http://localhost:8080';
 const PORT = process.env.PORT || 3001;
 
-// Helper function to forward data to backend
-function forwardToBackend(data) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(`${BACKEND_SERVER_URL}/api/data`);
-    const isHttps = url.protocol === 'https:';
-    const httpModule = isHttps ? https : http;
-    
-    const postData = JSON.stringify(data);
-    
-    const options = {
-      hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-      },
-    };
+// Store connected backend clients
+const backendClients = new Set();
 
-    const req = httpModule.request(options, (res) => {
-      let responseData = '';
-      
-      res.on('data', (chunk) => {
-        responseData += chunk;
-      });
-      
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          console.log(`✅ Forwarded to backend: ${data.symbol} | ${data.bars?.length || 0} bars`);
-          resolve(JSON.parse(responseData));
-        } else {
-          console.error(`❌ Backend error: ${res.statusCode} - ${responseData}`);
-          reject(new Error(`Backend returned ${res.statusCode}`));
-        }
-      });
-    });
+// Store latest data (for new connections)
+let latestData = null;
 
-    req.on('error', (error) => {
-      console.error(`❌ Error forwarding to backend:`, error.message);
-      reject(error);
-    });
-
-    req.write(postData);
-    req.end();
+// Broadcast data to all connected backend clients
+function broadcastToBackends(data) {
+  const dataStr = JSON.stringify(data);
+  let sentCount = 0;
+  
+  backendClients.forEach(client => {
+    if (client.readyState === 1) { // WebSocket.OPEN
+      try {
+        client.send(dataStr);
+        sentCount++;
+      } catch (error) {
+        console.error('❌ Error sending to backend client:', error.message);
+      }
+    }
   });
+  
+  if (sentCount > 0) {
+    console.log(`✅ Broadcasted to ${sentCount} backend client(s): ${data.symbol} | ${data.bars?.length || 0} bars`);
+  }
+  
+  return sentCount;
 }
 
 // Create HTTP server
@@ -78,7 +59,8 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       status: 'ok',
       service: 'MT5 Receiver',
-      backend: BACKEND_SERVER_URL,
+      connectedBackends: backendClients.size,
+      hasLatestData: !!latestData,
       timestamp: new Date().toISOString(),
     }));
     return;
@@ -99,27 +81,19 @@ const server = http.createServer(async (req, res) => {
         
         console.log(`📥 Received from MT5: ${data.symbol || 'Unknown'} | Bars: ${barsCount}`);
         
-        // Forward to backend server
-        try {
-          await forwardToBackend(data);
-          
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            status: 'ok',
-            message: 'Data received and forwarded to backend',
-            barsCount: barsCount,
-          }));
-        } catch (error) {
-          console.error('❌ Failed to forward to backend:', error.message);
-          
-          // Still return success to MT5 EA, but log the error
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            status: 'warning',
-            message: 'Data received but failed to forward to backend',
-            error: error.message,
-          }));
-        }
+        // Store latest data
+        latestData = data;
+        
+        // Broadcast to all connected backend clients via WebSocket
+        const sentCount = broadcastToBackends(data);
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          message: 'Data received',
+          barsCount: barsCount,
+          backendClients: sentCount,
+        }));
       } catch (error) {
         console.error('❌ Error parsing data:', error.message);
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -138,11 +112,50 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ status: 'error', message: 'Not found' }));
 });
 
+// Create WebSocket server for backend connections
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws, req) => {
+  const clientIp = req.socket.remoteAddress;
+  console.log(`✅ Backend client connected from ${clientIp}`);
+  
+  backendClients.add(ws);
+  
+  // Send latest data if available (for reconnection)
+  if (latestData) {
+    try {
+      ws.send(JSON.stringify(latestData));
+      console.log(`📤 Sent latest data to new backend client`);
+    } catch (error) {
+      console.error('❌ Error sending latest data:', error.message);
+    }
+  }
+  
+  ws.on('close', () => {
+    backendClients.delete(ws);
+    console.log(`❌ Backend client disconnected. Remaining: ${backendClients.size}`);
+  });
+  
+  ws.on('error', (error) => {
+    console.error('⚠️ Backend WebSocket error:', error.message);
+    backendClients.delete(ws);
+  });
+  
+  // Send welcome message
+  ws.send(JSON.stringify({
+    type: 'connection',
+    message: 'Connected to MT5 Receiver',
+    service: 'MT5 Receiver',
+    timestamp: new Date().toISOString(),
+  }));
+});
+
 // Start server
 server.listen(PORT, () => {
   console.log(`🚀 MT5 Receiver Service running on port ${PORT}`);
-  console.log(`📡 Backend Server: ${BACKEND_SERVER_URL}`);
-  console.log(`📥 Endpoint: POST /api/mt5-data`);
-  console.log(`❤️  Health Check: GET /health\n`);
+  console.log(`📥 MT5 Endpoint: POST /api/mt5-data`);
+  console.log(`🔌 Backend WebSocket: ws://localhost:${PORT}`);
+  console.log(`❤️  Health Check: GET /health`);
+  console.log(`⏳ Waiting for MT5 EA data and backend connections...\n`);
 });
 
