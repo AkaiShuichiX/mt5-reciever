@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mt5-receiver
+    env: node
+    buildCommand: ""
+    startCommand: node server.js
+    envVars:
+      - key: BACKEND_SERVER_URL
+        sync: false
+      - key: PORT
+        fromService:
+          type: web
+          name: mt5-receiver
+          property: port
+

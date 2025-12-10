@@ -1,0 +1,19 @@
+{
+  "name": "mt5-receiver-service",
+  "version": "1.0.0",
+  "description": "MT5 Receiver Service for Render.com - Receives data from MT5 EA and forwards to Backend Server",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "mt5",
+    "receiver",
+    "render"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {}
+}
+
